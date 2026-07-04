@@ -15,3 +15,8 @@
 *.userprefs
 .vs/
 .vscode/
+docs/.obsidian/*
+!docs/.obsidian/app.json
+!docs/.obsidian/appearance.json
+!docs/.obsidian/community-plugins.json
+!docs/.obsidian/core-plugins.json
