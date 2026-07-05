@@ -1,3 +1,4 @@
+using System.Collections;
 using System.Text.RegularExpressions;
 using Unity.Netcode;
 using Unity.Netcode.Transports.UTP;
@@ -12,6 +13,7 @@ public class LanBootstrap : MonoBehaviour
     [SerializeField] private Button _joinButton;
     [SerializeField] private Button _disconnectButton;
     [SerializeField] private TMP_Text _statusText;
+    [SerializeField] private float _connectionTimeoutSeconds = 10f;
 
     private const ushort Port = 7777;
     private static readonly Regex IpPattern = new Regex(
@@ -19,6 +21,8 @@ public class LanBootstrap : MonoBehaviour
 
     private SessionManager _session;
     private bool _subscribedToSession;
+    private bool _isConnecting;
+    private Coroutine _timeoutCoroutine;
 
     private void Awake()
     {
@@ -26,6 +30,7 @@ public class LanBootstrap : MonoBehaviour
             _statusText == null || _disconnectButton == null)
         {
             Debug.LogError("[LanBootstrap] One or more UI references are not assigned in the Inspector!");
+            enabled = false; // stop further execution cleanly
             return;
         }
 
@@ -34,6 +39,15 @@ public class LanBootstrap : MonoBehaviour
         _disconnectButton.onClick.AddListener(Disconnect);
 
         NetworkManager.Singleton.OnTransportFailure += OnTransportFailure;
+    }
+
+    private void OnDestroy()
+    {
+        // guard: NetworkManager may already be gone during scene unload
+        if (NetworkManager.Singleton == null) return;
+
+        NetworkManager.Singleton.OnTransportFailure -= OnTransportFailure;
+        UnsubscribeFromConnectionEvents();
     }
 
     private UnityTransport Transport =>
@@ -49,7 +63,16 @@ public class LanBootstrap : MonoBehaviour
 
         Transport.SetConnectionData("0.0.0.0", Port);
         SubscribeToConnectionEvents();
-        NetworkManager.Singleton.StartHost();
+
+        bool started = NetworkManager.Singleton.StartHost();
+        if (!started)
+        {
+            // StartHost returns false if NGO rejects startup (e.g. already shutting down)
+            SetStatus("Failed to start host. Try again.");
+            UnsubscribeFromConnectionEvents();
+            return;
+        }
+
         SetInteractable(false);
         SetStatus($"Hosting on port {Port}");
     }
@@ -68,11 +91,11 @@ public class LanBootstrap : MonoBehaviour
         if (string.IsNullOrWhiteSpace(rawInput))
         {
             ip = "127.0.0.1";
-            SetStatus("No IP entered. Defaulting to localhost (127.0.0.1).");
+            SetStatus("No IP entered — defaulting to localhost.");
         }
         else if (!IpPattern.IsMatch(rawInput))
         {
-            SetStatus($"'{rawInput}' is not a valid IP address (example: 192.168.1.5). Connection cancelled.");
+            SetStatus($"'{rawInput}' is not a valid IP (e.g. 192.168.1.5). Cancelled.");
             return;
         }
         else
@@ -82,9 +105,19 @@ public class LanBootstrap : MonoBehaviour
 
         Transport.SetConnectionData(ip, Port);
         SubscribeToConnectionEvents();
-        NetworkManager.Singleton.StartClient();
+
+        bool started = NetworkManager.Singleton.StartClient();
+        if (!started)
+        {
+            SetStatus("Failed to start client. Try again.");
+            UnsubscribeFromConnectionEvents();
+            return;
+        }
+
+        _isConnecting = true;
         SetInteractable(false);
-        SetStatus($"Connecting to {ip}:{Port} ...");
+        SetStatus($"Connecting to {ip}:{Port}...");
+        _timeoutCoroutine = StartCoroutine(ConnectionTimeout());
     }
 
     public void Disconnect()
@@ -96,22 +129,16 @@ public class LanBootstrap : MonoBehaviour
         }
 
         bool wasHost = NetworkManager.Singleton.IsHost;
-
+        CancelTimeout();
         UnsubscribeFromConnectionEvents();
         NetworkManager.Singleton.Shutdown();
-        SetInteractable(true);
-        _subscribedToSession = false;
+        ResetState();
 
         SetStatus(wasHost
             ? "Stopped hosting. Session ended for all clients."
             : "Left the session.");
     }
 
-    /// <summary>
-    /// Wires up connection/disconnection callbacks for the session about to start.
-    /// Always paired with <see cref="UnsubscribeFromConnectionEvents"/> in <see cref="Disconnect"/>
-    /// so callbacks never stack across repeated host/join cycles.
-    /// </summary>
     private void SubscribeToConnectionEvents()
     {
         NetworkManager.Singleton.OnClientConnectedCallback += OnClientConnected;
@@ -120,27 +147,106 @@ public class LanBootstrap : MonoBehaviour
 
     private void UnsubscribeFromConnectionEvents()
     {
+        if (NetworkManager.Singleton == null) return;
         NetworkManager.Singleton.OnClientConnectedCallback -= OnClientConnected;
         NetworkManager.Singleton.OnClientDisconnectCallback -= OnClientDisconnected;
     }
 
     private void OnClientConnected(ulong clientId)
     {
+        // only react to our own connection (local client id)
+        if (!NetworkManager.Singleton.IsHost &&
+            clientId != NetworkManager.Singleton.LocalClientId) return;
+
+        CancelTimeout();
+        _isConnecting = false;
+
         if (_subscribedToSession) return;
 
         _session = FindFirstObjectByType<SessionManager>();
         if (_session != null)
         {
-            _session.ConnectedClientCount.OnValueChanged += (oldValue, newValue) =>
-                SetStatus($"Connected clients: {newValue}");
-            SetStatus($"Connected clients: {_session.ConnectedClientCount.Value}");
+            _session.ConnectedClientCount.OnValueChanged += OnClientCountChanged;
+            SetStatus($"Connected. Clients: {_session.ConnectedClientCount.Value}");
             _subscribedToSession = true;
+        }
+        else
+        {
+            // SessionManager not spawned yet — wait a frame and retry
+            StartCoroutine(WaitForSessionManager());
         }
     }
 
     private void OnClientDisconnected(ulong clientId)
     {
-        SetStatus("Failed to connect. Check the IP address and make sure the host is running.");
+        // if we're the host, other clients disconnecting is normal — just refresh count
+        if (NetworkManager.Singleton.IsHost)
+        {
+            if (_session != null)
+                SetStatus($"Client {clientId} left. Clients: {_session.ConnectedClientCount.Value}");
+            return;
+        }
+
+        // we're a client — this means we got kicked or failed to connect
+        CancelTimeout();
+
+        string reason = NetworkManager.Singleton.DisconnectReason;
+        string msg = string.IsNullOrEmpty(reason)
+            ? "Disconnected from host."
+            : $"Disconnected: {reason}";
+
+        SetStatus(msg);
+        UnsubscribeFromConnectionEvents();
+        ResetState();
+    }
+
+    private IEnumerator WaitForSessionManager()
+    {
+        yield return null; // wait one frame for NGO to spawn network objects
+        _session = FindFirstObjectByType<SessionManager>();
+        if (_session != null)
+        {
+            _session.ConnectedClientCount.OnValueChanged += OnClientCountChanged;
+            SetStatus($"Connected. Clients: {_session.ConnectedClientCount.Value}");
+            _subscribedToSession = true;
+        }
+        else
+        {
+            Debug.LogWarning("[LanBootstrap] SessionManager not found after connection. Is it in the scene?");
+            SetStatus("Connected but session data unavailable.");
+        }
+    }
+
+    private IEnumerator ConnectionTimeout()
+    {
+        yield return new WaitForSeconds(_connectionTimeoutSeconds);
+
+        if (_isConnecting)
+        {
+            SetStatus($"Connection timed out after {_connectionTimeoutSeconds}s. Host may be unreachable.");
+            UnsubscribeFromConnectionEvents();
+            NetworkManager.Singleton.Shutdown();
+            ResetState();
+        }
+    }
+
+    private void OnClientCountChanged(int oldValue, int newValue)
+        => SetStatus($"Connected clients: {newValue}");
+
+    private void CancelTimeout()
+    {
+        if (_timeoutCoroutine != null)
+        {
+            StopCoroutine(_timeoutCoroutine);
+            _timeoutCoroutine = null;
+        }
+    }
+
+    private void ResetState()
+    {
+        _isConnecting = false;
+        _subscribedToSession = false;
+        _session = null;
         SetInteractable(true);
     }
 
@@ -158,7 +264,9 @@ public class LanBootstrap : MonoBehaviour
 
     private void OnTransportFailure()
     {
-        SetStatus($"Could not start on port {Port}. It may already be in use by another process. Close other instances and try again.");
-        SetInteractable(true);
+        CancelTimeout();
+        UnsubscribeFromConnectionEvents();
+        SetStatus($"Transport failed. Port {Port} may already be in use.");
+        ResetState();
     }
 }

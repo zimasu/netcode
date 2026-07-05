@@ -11,17 +11,24 @@ public class SessionManager : NetworkBehaviour
 
     public override void OnNetworkSpawn()
     {
-        if (IsServer)
+        if (!IsServer) return;
+
+        if (NetworkManager.Singleton == null)
         {
-            NetworkManager.Singleton.OnClientConnectedCallback += RefreshCount;
-            NetworkManager.Singleton.OnClientDisconnectCallback += RefreshCount;
-            RefreshCount(0);
+            Debug.LogError("[SessionManager] NetworkManager missing on spawn.");
+            return;
         }
+
+        NetworkManager.Singleton.OnClientConnectedCallback += RefreshCount;
+        NetworkManager.Singleton.OnClientDisconnectCallback += RefreshCount;
+        RefreshCount(0);
     }
 
     public override void OnNetworkDespawn()
     {
-        if (IsServer)
+        if (!IsServer) return;
+
+        if (NetworkManager.Singleton != null)
         {
             NetworkManager.Singleton.OnClientConnectedCallback -= RefreshCount;
             NetworkManager.Singleton.OnClientDisconnectCallback -= RefreshCount;
@@ -30,6 +37,7 @@ public class SessionManager : NetworkBehaviour
 
     private void RefreshCount(ulong clientId)
     {
+        if (NetworkManager.Singleton == null || !IsServer) return;
         ConnectedClientCount.Value = NetworkManager.Singleton.ConnectedClientsIds.Count;
     }
 }

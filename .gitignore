@@ -20,3 +20,7 @@ docs/.obsidian/*
 !docs/.obsidian/appearance.json
 !docs/.obsidian/community-plugins.json
 !docs/.obsidian/core-plugins.json
+Assets/TextMesh Pro/
+Assets/TextMesh Pro.metaBuilds/
+Builds/
+Assets/TextMesh Pro.meta
